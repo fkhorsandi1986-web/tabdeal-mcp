@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: tabdeal-live-scanner
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python app.py
+    healthCheckPath: /health
+    envVars:
+      - key: DEPTH_LEVELS
+        value: "20"
+      - key: SUBSCRIBE_BATCH
+        value: "100"
+      - key: MARKET_REFRESH_SECONDS
+        value: "300"
+      - key: MAX_HISTORY
+        value: "30"
