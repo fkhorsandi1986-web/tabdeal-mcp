@@ -1,145 +1,138 @@
-
 import asyncio
-import json
+import logging
 import os
-import statistics
-import time
-from collections import defaultdict, deque
-from datetime import datetime
-from zoneinfo import ZoneInfo
+from contextlib import asynccontextmanager
 
-import websockets
+import uvicorn
+from starlette.applications import Starlette
+from starlette.middleware.cors import CORSMiddleware
+from starlette.requests import Request
+from starlette.responses import JSONResponse
+from starlette.routing import Route
 
-WS_URL = "wss://api1.tabdeal.org/stream/"
-SYMBOLS = [s.strip().lower() for s in os.getenv("SYMBOLS", "arxusdt,btcusdt").split(",") if s.strip()]
-DEPTH_LEVELS = int(os.getenv("DEPTH_LEVELS", "20"))
-ALERT_COOLDOWN = int(os.getenv("ALERT_COOLDOWN", "300"))
-IMBALANCE_ALERT = float(os.getenv("IMBALANCE_ALERT", "0.60"))
+from live_scanner import LiveScanner, fetch_public_trades
 
-# Telegram is optional in v1. Put these in Render Environment Variables later.
-TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+logger = logging.getLogger("tabdeal-api")
+scanner = LiveScanner()
+scanner_task: asyncio.Task | None = None
 
-last_alert = defaultdict(float)
-history = defaultdict(lambda: deque(maxlen=20))
 
-def now_iran():
-    return datetime.now(ZoneInfo("Asia/Tehran")).strftime("%Y-%m-%d %H:%M:%S")
-
-async def telegram(text):
-    if not (TG_TOKEN and TG_CHAT_ID):
-        print("[TELEGRAM DISABLED]", text)
-        return
-    import urllib.request
-    import urllib.parse
-    data = urllib.parse.urlencode({"chat_id": TG_CHAT_ID, "text": text}).encode()
-    url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
+@asynccontextmanager
+async def lifespan(app: Starlette):
+    global scanner_task
+    scanner_task = asyncio.create_task(scanner.start(), name="tabdeal-live-scanner")
     try:
-        await asyncio.to_thread(urllib.request.urlopen, url, data, 15)
-    except Exception as e:
-        print("Telegram error:", e)
+        yield
+    finally:
+        await scanner.stop()
+        if scanner_task:
+            scanner_task.cancel()
+            await asyncio.gather(scanner_task, return_exceptions=True)
 
-def analyze(symbol, data):
-    bids = data.get("b", [])
-    asks = data.get("a", [])
-    if not bids or not asks:
-        return None
 
-    bids = [(float(p), float(q)) for p, q in bids[:DEPTH_LEVELS]]
-    asks = [(float(p), float(q)) for p, q in asks[:DEPTH_LEVELS]]
+async def health(request: Request):
+    snapshot = await scanner.snapshot(limit=1)
+    return JSONResponse({
+        "status": "ok",
+        "service": "tabdeal-live-scanner",
+        "mode": "read-only",
+        "connected": snapshot["connected"],
+        "market_count": snapshot["market_count"],
+        "markets_with_live_book": snapshot["markets_with_live_book"],
+        "last_message_at_ms": snapshot["last_message_at_ms"],
+        "last_error": snapshot["last_error"],
+    })
 
-    best_bid = bids[0][0]
-    best_ask = asks[0][0]
-    mid = (best_bid + best_ask) / 2
-    spread_pct = (best_ask - best_bid) / mid * 100 if mid else 0
 
-    bid_value = sum(p*q for p, q in bids)
-    ask_value = sum(p*q for p, q in asks)
-    imbalance = (bid_value - ask_value) / (bid_value + ask_value) if (bid_value + ask_value) else 0
+async def capabilities(request: Request):
+    return JSONResponse({
+        "service": "tabdeal-live-scanner",
+        "read_only": True,
+        "live": {
+            "active_market_discovery": True,
+            "orderbook_websocket": True,
+            "orderbook_pressure": True,
+            "spread": True,
+            "imbalance": True,
+            "rapid_imbalance_shift": True,
+            "public_recent_trades": True,
+        },
+        "not_claimed_without_a_public_source": [
+            "private account data",
+            "private orders",
+            "private leverage positions",
+            "private liquidations",
+            "private open interest",
+            "funding data when Tabdeal does not expose it publicly",
+        ],
+        "notes": [
+            "The scanner never places, cancels, or modifies orders.",
+            "Order-book values are visible market liquidity, not proof of whale ownership.",
+            "Recent trades are available on demand from Tabdeal's public REST endpoint.",
+        ],
+    })
 
-    largest_bid = max(bids, key=lambda x: x[1])
-    largest_ask = max(asks, key=lambda x: x[1])
 
-    history[symbol].append(imbalance)
-    prev = history[symbol][-2] if len(history[symbol]) >= 2 else imbalance
-    shift = imbalance - prev
+async def scanner_endpoint(request: Request):
+    try:
+        limit = int(request.query_params.get("limit", "100"))
+    except ValueError:
+        limit = 100
+    return JSONResponse(await scanner.snapshot(limit=limit))
 
-    return {
-        "symbol": symbol.upper(),
-        "best_bid": best_bid,
-        "best_ask": best_ask,
-        "mid": mid,
-        "spread_pct": spread_pct,
-        "bid_value": bid_value,
-        "ask_value": ask_value,
-        "imbalance": imbalance,
-        "shift": shift,
-        "largest_bid": largest_bid,
-        "largest_ask": largest_ask,
-    }
 
-def format_report(x):
-    pressure = "خریدار" if x["imbalance"] > 0.15 else "فروشنده" if x["imbalance"] < -0.15 else "خنثی"
-    return (
-        f"📡 {x['symbol']} | {now_iran()}\n"
-        f"قیمت میانی: {x['mid']:.8g}\n"
-        f"Bid: {x['best_bid']:.8g} | Ask: {x['best_ask']:.8g}\n"
-        f"Spread: {x['spread_pct']:.3f}%\n"
-        f"قدرت اردربوک: {pressure} | imbalance={x['imbalance']:+.2f}\n"
-        f"بزرگ‌ترین سفارش خریدِ قابل‌مشاهده: {x['largest_bid'][1]:.8g} @ {x['largest_bid'][0]:.8g}\n"
-        f"بزرگ‌ترین سفارش فروشِ قابل‌مشاهده: {x['largest_ask'][1]:.8g} @ {x['largest_ask'][0]:.8g}"
-    )
+async def markets_endpoint(request: Request):
+    return JSONResponse(await scanner.market_list())
 
-async def maybe_alert(x):
-    t = time.time()
-    symbol = x["symbol"]
-    strong = abs(x["imbalance"]) >= IMBALANCE_ALERT
-    sharp = abs(x["shift"]) >= 0.25
-    if not (strong or sharp):
-        return
 
-    if t - last_alert[symbol] < ALERT_COOLDOWN:
-        return
+async def orderbook_endpoint(request: Request):
+    symbol = request.path_params["symbol"]
+    try:
+        levels = int(request.query_params.get("levels", "20"))
+    except ValueError:
+        levels = 20
+    return JSONResponse(await scanner.orderbook(symbol, levels=levels))
 
-    if x["imbalance"] >= IMBALANCE_ALERT:
-        title = "🟢 فشار خرید غیرعادی"
-    elif x["imbalance"] <= -IMBALANCE_ALERT:
-        title = "🔴 فشار فروش غیرعادی"
-    else:
-        title = "🚨 تغییر سریع اردربوک"
 
-    last_alert[symbol] = t
-    await telegram(title + "\n\n" + format_report(x))
+async def trades_endpoint(request: Request):
+    symbol = request.path_params["symbol"]
+    try:
+        limit = int(request.query_params.get("limit", "100"))
+    except ValueError:
+        limit = 100
+    try:
+        return JSONResponse(await fetch_public_trades(symbol, limit=limit))
+    except Exception as exc:
+        logger.warning("Trades request failed for %s: %s", symbol, exc)
+        return JSONResponse({
+            "source": "Tabdeal public REST trades",
+            "symbol": symbol.upper(),
+            "error": str(exc),
+        }, status_code=502)
 
-async def connect():
-    streams = [f"{s}@depth@2000ms" for s in SYMBOLS]
-    sub = {"method": "SUBSCRIBE", "params": streams, "id": 1}
-    async with websockets.connect(WS_URL, ping_interval=20, ping_timeout=20) as ws:
-        await ws.send(json.dumps(sub))
-        print("Connected. Subscribed:", streams)
-        async for raw in ws:
-            try:
-                msg = json.loads(raw)
-                data = msg.get("data", {})
-                symbol = str(data.get("s", "")).lower()
-                if symbol not in SYMBOLS:
-                    continue
-                x = analyze(symbol, data)
-                if x:
-                    print(format_report(x))
-                    await maybe_alert(x)
-            except Exception as e:
-                print("Message error:", e)
 
-async def main():
-    print("Tabdeal monitor v1")
-    print("Symbols:", SYMBOLS)
-    while True:
-        try:
-            await connect()
-        except Exception as e:
-            print("WebSocket disconnected:", e)
-            await asyncio.sleep(5)
+routes = [
+    Route("/health", health, methods=["GET"]),
+    Route("/api/capabilities", capabilities, methods=["GET"]),
+    Route("/api/scanner", scanner_endpoint, methods=["GET"]),
+    Route("/api/markets", markets_endpoint, methods=["GET"]),
+    Route("/api/orderbook/{symbol}", orderbook_endpoint, methods=["GET"]),
+    Route("/api/trades/{symbol}", trades_endpoint, methods=["GET"]),
+]
+
+app = Starlette(debug=False, routes=routes, lifespan=lifespan)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["GET"],
+    allow_headers=["*"],
+)
+
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    port = int(os.environ.get("PORT", "8000"))
+    uvicorn.run("app:app", host="0.0.0.0", port=port, log_level=os.getenv("LOG_LEVEL", "info").lower())
