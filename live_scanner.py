@@ -21,12 +21,7 @@ logger = logging.getLogger("tabdeal-live-scanner")
 
 
 class LiveScanner:
-    """Read-only Tabdeal market collector.
-
-    The documented public market websocket provides order-book updates.
-    We keep the latest book for every active market and derive pressure,
-    spread and anomaly metrics without placing any orders.
-    """
+    """Read-only Tabdeal market collector."""
 
     def __init__(self) -> None:
         self.symbols: list[str] = []
@@ -60,7 +55,6 @@ class LiveScanner:
                 continue
             active.append(symbol)
 
-        # Stable, de-duplicated order.
         result = list(dict.fromkeys(active))
         if not result:
             raise RuntimeError("No active markets returned by exchangeInfo")
@@ -69,10 +63,15 @@ class LiveScanner:
     async def refresh_markets(self) -> None:
         symbols = await self.fetch_exchange_info()
         async with self._lock:
+            old = set(self.symbols)
             self.symbols = symbols
             self.last_market_refresh = time.time()
             for symbol in symbols:
                 self.history.setdefault(symbol, deque(maxlen=MAX_HISTORY))
+            # Remove stale books for markets no longer active.
+            for symbol in old - set(symbols):
+                self.books.pop(symbol, None)
+                self.history.pop(symbol, None)
         logger.info("Loaded %d active markets", len(symbols))
 
     @staticmethod
@@ -83,7 +82,7 @@ class LiveScanner:
             return None
 
         def parse(levels: list[Any]) -> list[tuple[float, float]]:
-            parsed = []
+            parsed: list[tuple[float, float]] = []
             for level in levels[:depth_levels]:
                 if not isinstance(level, (list, tuple)) or len(level) < 2:
                     continue
@@ -157,13 +156,18 @@ class LiveScanner:
             metrics["received_at_ms"] = int(now * 1000)
             metrics["exchange_event_at_ms"] = event_time
             metrics["age_ms"] = max(0, int(now * 1000 - event_time)) if event_time else None
-            metrics["pressure"] = (
-                "BUY" if metrics["imbalance"] >= 0.15 else
-                "SELL" if metrics["imbalance"] <= -0.15 else "NEUTRAL"
-            )
+            metrics["pressure"] = "BUY" if metrics["imbalance"] >= 0.15 else "SELL" if metrics["imbalance"] <= -0.15 else "NEUTRAL"
             metrics["anomaly"] = bool(abs(metrics["imbalance"]) >= 0.60 or abs(shift) >= 0.25)
             self.books[symbol] = metrics
             self.last_message_at = now
+
+    async def _subscribe(self, ws, symbols: list[str]) -> None:
+        streams = [f"{symbol.lower()}@depth@2000ms" for symbol in symbols]
+        for start in range(0, len(streams), SUBSCRIBE_BATCH):
+            batch = streams[start:start + SUBSCRIBE_BATCH]
+            request = {"method": "SUBSCRIBE", "params": batch, "id": start // SUBSCRIBE_BATCH + 1}
+            await ws.send(json.dumps(request))
+        logger.info("Subscribed to %d order-book streams", len(streams))
 
     async def websocket_loop(self) -> None:
         backoff = 2
@@ -172,7 +176,7 @@ class LiveScanner:
                 if not self.symbols or time.time() - self.last_market_refresh >= MARKET_REFRESH_SECONDS:
                     await self.refresh_markets()
 
-                streams = [f"{symbol.lower()}@depth@2000ms" for symbol in self.symbols]
+                subscribed_symbols = list(self.symbols)
                 async with websockets.connect(
                     TABDEAL_WS,
                     ping_interval=20,
@@ -183,22 +187,30 @@ class LiveScanner:
                     self.connected = True
                     self.last_error = None
                     backoff = 2
+                    await self._subscribe(ws, subscribed_symbols)
 
-                    for start in range(0, len(streams), SUBSCRIBE_BATCH):
-                        batch = streams[start:start + SUBSCRIBE_BATCH]
-                        request = {"method": "SUBSCRIBE", "params": batch, "id": start // SUBSCRIBE_BATCH + 1}
-                        await ws.send(json.dumps(request))
-
-                    logger.info("WebSocket connected: %d subscriptions", len(streams))
-                    async for raw in ws:
-                        await self.handle_message(raw)
-                        if self._stop.is_set():
-                            break
+                    while not self._stop.is_set():
+                        try:
+                            raw = await asyncio.wait_for(ws.recv(), timeout=30)
+                            if isinstance(raw, bytes):
+                                raw = raw.decode("utf-8", errors="replace")
+                            await self.handle_message(raw)
+                        except asyncio.TimeoutError:
+                            # Keep the socket alive and refresh the market list periodically.
+                            if time.time() - self.last_market_refresh >= MARKET_REFRESH_SECONDS:
+                                await self.refresh_markets()
+                                current = set(self.symbols)
+                                missing = [s for s in self.symbols if s not in set(subscribed_symbols)]
+                                if missing:
+                                    await self._subscribe(ws, missing)
+                                    subscribed_symbols.extend(missing)
+                                subscribed_symbols = [s for s in subscribed_symbols if s in current]
+                            continue
 
             except (ConnectionClosed, OSError, asyncio.TimeoutError, httpx.HTTPError, RuntimeError) as exc:
                 self.last_error = str(exc)
                 logger.warning("WebSocket loop error: %s", exc)
-            except Exception as exc:  # Defensive: scanner must stay alive.
+            except Exception as exc:
                 self.last_error = f"{type(exc).__name__}: {exc}"
                 logger.exception("Unexpected scanner error")
             finally:
@@ -209,7 +221,7 @@ class LiveScanner:
                 backoff = min(backoff * 2, 60)
 
     async def start(self) -> None:
-        await self.refresh_markets()
+        # websocket_loop owns its own retry cycle, including exchangeInfo failures.
         await self.websocket_loop()
 
     async def stop(self) -> None:
@@ -219,7 +231,7 @@ class LiveScanner:
         limit = max(1, min(int(limit), 1000))
         async with self._lock:
             rows = []
-            for symbol, item in self.books.items():
+            for item in self.books.values():
                 row = {k: v for k, v in item.items() if k not in {"bid_levels", "ask_levels"}}
                 rows.append(row)
             rows.sort(key=lambda x: (abs(float(x.get("imbalance", 0))), -float(x.get("spread_pct", 0))), reverse=True)
