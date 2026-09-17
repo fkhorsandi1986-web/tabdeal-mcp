@@ -56,7 +56,7 @@ def test_build_target_rejects_neutral_book():
 def test_build_targets_sorts_by_signal_strength_and_limits_results():
     markets = [
         base_item(symbol="A", imbalance=0.16, shift=0.00),
-        base_item(symbol="B", imbalance=0.40, shift=0.10),
+        base_item(symbol="B", imbalance=0.55, shift=0.10),
         base_item(symbol="C", imbalance=-0.50, shift=-0.10),
         base_item(symbol="D", imbalance=0.01, shift=0.00),
     ]
