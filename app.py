@@ -63,6 +63,7 @@ async def capabilities(request: Request):
             "public_recent_trades": True,
             "trade_flow_confirmation": True,
             "analytical_targets": True,
+            "signal_tiers": True,
         },
         "not_claimed_without_a_public_source": [
             "private account data",
@@ -77,7 +78,7 @@ async def capabilities(request: Request):
             "Order-book values are visible market liquidity, not proof of whale ownership.",
             "Recent trades are available from Tabdeal's public REST endpoint.",
             "Targets combine order-book imbalance, shift, spread quality, and recent public trade flow.",
-            "Targets are transparent analytical levels, not guaranteed predictions.",
+            "Signal tiers are filters for data quality and confirmation, not guaranteed predictions.",
         ],
     })
 
@@ -100,6 +101,7 @@ async def _trade_flow(symbol: str, direction: str) -> dict | None:
         buy_value = 0.0
         sell_value = 0.0
         total_value = 0.0
+        valid_count = 0
         for trade in trades:
             if not isinstance(trade, dict):
                 continue
@@ -111,21 +113,20 @@ async def _trade_flow(symbol: str, direction: str) -> dict | None:
                 continue
             if quote <= 0:
                 continue
-            # Tabdeal follows the Binance-style isBuyerMaker convention:
-            # false means the buyer was the taker; true means the seller was the taker.
             if bool(trade.get("isBuyerMaker", False)):
                 sell_value += quote
             else:
                 buy_value += quote
             total_value += quote
+            valid_count += 1
 
-        if total_value <= 0:
+        if total_value <= 0 or valid_count < 3:
             return None
 
         buy_ratio = buy_value / total_value
         flow_ratio = buy_ratio if direction == "LONG" else 1.0 - buy_ratio
         return {
-            "trade_count": len(trades),
+            "trade_count": valid_count,
             "trade_quote_volume": round(total_value, 8),
             "taker_buy_ratio": round(buy_ratio, 4),
             "directional_flow_ratio": round(flow_ratio, 4),
@@ -135,35 +136,92 @@ async def _trade_flow(symbol: str, direction: str) -> dict | None:
         return None
 
 
-async def _enrich_targets(targets: list[dict]) -> list[dict]:
+def _classify_signal(target: dict, flow: dict) -> tuple[str, list[str]] | None:
+    """Classify only data-confirmed targets into A/B; conflicting/weak ones are rejected."""
+    spread = float(target.get("spread_pct", 99.0))
+    imbalance = abs(float(target.get("imbalance", 0.0)))
+    shift = abs(float(target.get("shift", 0.0)))
+    flow_ratio = float(flow.get("directional_flow_ratio", 0.0))
+
+    # Hard reject: expensive spread or directional trade flow disagreement.
+    if spread > 1.20 or flow_ratio < 0.52:
+        return None
+
+    # A = strong confirmation: deep book imbalance, agreeing aggressive flow,
+    # tight spread, plus either measurable shift or exceptionally strong imbalance.
+    if (
+        imbalance >= 0.45
+        and flow_ratio >= 0.65
+        and spread <= 0.70
+        and (shift >= 0.005 or imbalance >= 0.65)
+    ):
+        reasons = [
+            "A: strong order-book imbalance",
+            "A: agreeing recent taker flow",
+            "A: acceptable spread",
+        ]
+        if shift >= 0.005:
+            reasons.append("A: imbalance shift confirms direction")
+        else:
+            reasons.append("A: exceptionally strong static imbalance compensates for weak shift")
+        return "A_STRONG", reasons
+
+    # B = watch: direction is confirmed, but one strong-confirmation component
+    # is missing. It remains visible so the scanner can monitor it for escalation.
+    if imbalance >= 0.20 and flow_ratio >= 0.52 and spread <= 1.20:
+        reasons = [
+            "B: order-book direction confirmed",
+            "B: recent taker flow agrees",
+            "B: requires further confirmation before A",
+        ]
+        if shift < 0.005:
+            reasons.append("B: temporal shift is weak")
+        if spread > 0.70:
+            reasons.append("B: spread is wider than A threshold")
+        if flow_ratio < 0.65:
+            reasons.append("B: trade-flow confirmation is moderate")
+        return "B_WATCH", reasons
+
+    return None
+
+
+async def _enrich_targets(targets: list[dict]) -> tuple[list[dict], dict[str, int]]:
     semaphore = asyncio.Semaphore(8)
+    counts = {"A_STRONG": 0, "B_WATCH": 0, "rejected": 0}
 
     async def one(target: dict) -> dict | None:
         async with semaphore:
             flow = await _trade_flow(target["symbol"], target["direction"])
         if not flow:
+            counts["rejected"] += 1
             return None
 
-        # Require the recent taker flow to agree with the order-book direction.
-        if flow["directional_flow_ratio"] < 0.52:
+        classification = _classify_signal(target, flow)
+        if classification is None:
+            counts["rejected"] += 1
             return None
 
-        target = dict(target)
-        target["trade_flow"] = flow
-        target["reasons"] = list(target.get("reasons", [])) + [
-            "recent public trade flow confirms direction"
-        ]
-        target["signal_strength"] = round(
-            min(100.0, target["signal_strength"] * 0.75 + flow["directional_flow_ratio"] * 25.0),
+        tier, tier_reasons = classification
+        enriched = dict(target)
+        enriched["signal_tier"] = tier
+        enriched["trade_flow"] = flow
+        enriched["reasons"] = list(enriched.get("reasons", [])) + tier_reasons
+        # Strength remains a descriptive indicator. It is adjusted for actual
+        # trade-flow agreement but is never presented as probability.
+        enriched["signal_strength"] = round(
+            min(100.0, enriched["signal_strength"] * 0.75 + flow["directional_flow_ratio"] * 25.0),
             2,
         )
-        target["method"] = "order-book imbalance + shift + spread + recent public trade flow"
-        return target
+        enriched["method"] = "order-book imbalance + shift + spread + recent public trade flow + signal tier"
+        counts[tier] += 1
+        return enriched
 
     enriched = await asyncio.gather(*(one(target) for target in targets))
     results = [item for item in enriched if item is not None]
-    results.sort(key=lambda x: x["signal_strength"], reverse=True)
-    return results
+    # Always put strong confirmations first; within a tier use signal strength.
+    tier_order = {"A_STRONG": 0, "B_WATCH": 1}
+    results.sort(key=lambda x: (tier_order.get(x["signal_tier"], 9), -x["signal_strength"]))
+    return results, counts
 
 
 async def targets_endpoint(request: Request):
@@ -176,7 +234,7 @@ async def targets_endpoint(request: Request):
     # First shortlist by live order-book quality, then confirm only the best
     # candidates with recent public trades to avoid hammering the REST API.
     candidates = build_targets(snapshot["markets"], limit=60)
-    targets = await _enrich_targets(candidates)
+    targets, tier_counts = await _enrich_targets(candidates)
     targets = targets[: max(1, min(limit, 100))]
 
     return JSONResponse({
@@ -185,8 +243,14 @@ async def targets_endpoint(request: Request):
         "market_count": snapshot["market_count"],
         "live_market_count": snapshot["markets_with_live_book"],
         "candidate_count_before_trade_confirmation": len(candidates),
+        "signal_tier_counts": tier_counts,
         "targets": targets,
-        "method": "order-book imbalance + shift + spread + recent public trade flow",
+        "method": "order-book imbalance + shift + spread + recent public trade flow + signal tier",
+        "tier_definitions": {
+            "A_STRONG": "strong book + agreeing taker flow + tight spread + shift or exceptionally strong imbalance",
+            "B_WATCH": "direction confirmed but at least one A component is still weak",
+            "rejected": "spread/flow/confirmation conflict; omitted from targets",
+        },
         "not_a_prediction": True,
     })
 
