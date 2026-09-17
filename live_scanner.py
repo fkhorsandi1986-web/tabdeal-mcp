@@ -27,7 +27,7 @@ class LiveScanner:
     def __init__(self) -> None:
         self.symbols: list[str] = []
         self.books: dict[str, dict[str, Any]] = {}
-        self.history: dict[str, deque[float]] = {}
+        self.history: dict[str, deque[dict[str, float]]] = {}
         self.last_error: str | None = None
         self.last_market_refresh = 0.0
         self.last_message_at = 0.0
@@ -62,7 +62,6 @@ class LiveScanner:
         return result
 
     async def refresh_markets(self) -> bool:
-        """Refresh active markets and report whether the subscription set changed."""
         symbols = await self.fetch_exchange_info()
         async with self._lock:
             old = set(self.symbols)
@@ -114,6 +113,8 @@ class LiveScanner:
         imbalance = (bid_value - ask_value) / total if total else 0.0
         largest_bid = max(bids, key=lambda x: x[1])
         largest_ask = max(asks, key=lambda x: x[1])
+        largest_bid_value = largest_bid[0] * largest_bid[1]
+        largest_ask_value = largest_ask[0] * largest_ask[1]
 
         return {
             "symbol": symbol,
@@ -123,9 +124,12 @@ class LiveScanner:
             "spread_pct": spread_pct,
             "bid_value": bid_value,
             "ask_value": ask_value,
+            "total_depth_value": total,
             "imbalance": imbalance,
             "largest_bid": {"price": largest_bid[0], "qty": largest_bid[1]},
             "largest_ask": {"price": largest_ask[0], "qty": largest_ask[1]},
+            "largest_bid_share": largest_bid_value / bid_value if bid_value else 0.0,
+            "largest_ask_share": largest_ask_value / ask_value if ask_value else 0.0,
             "bid_levels": bids,
             "ask_levels": asks,
         }
@@ -153,10 +157,37 @@ class LiveScanner:
 
         async with self._lock:
             history = self.history.setdefault(symbol, deque(maxlen=MAX_HISTORY))
-            previous = history[-1] if history else metrics["imbalance"]
-            shift = metrics["imbalance"] - previous
-            history.append(metrics["imbalance"])
+            previous = history[-1] if history else None
+            previous_imbalance = previous["imbalance"] if previous else metrics["imbalance"]
+            shift = metrics["imbalance"] - previous_imbalance
+            previous_mid = previous["mid"] if previous else metrics["mid"]
+            price_change_pct = ((metrics["mid"] - previous_mid) / previous_mid * 100.0) if previous_mid else 0.0
+            history.append({
+                "imbalance": metrics["imbalance"],
+                "mid": metrics["mid"],
+                "largest_bid_share": metrics["largest_bid_share"],
+                "largest_ask_share": metrics["largest_ask_share"],
+            })
+
+            recent = list(history)[-10:]
+            same_direction = sum(
+                1 for row in recent
+                if (row["imbalance"] >= 0.15) == (metrics["imbalance"] >= 0.15)
+                and abs(row["imbalance"]) >= 0.15
+            )
+            persistence = same_direction / len(recent) if recent else 0.0
+            if metrics["imbalance"] >= 0.15:
+                opposite_wall_share = metrics["largest_ask_share"]
+            elif metrics["imbalance"] <= -0.15:
+                opposite_wall_share = metrics["largest_bid_share"]
+            else:
+                opposite_wall_share = max(metrics["largest_bid_share"], metrics["largest_ask_share"])
+
             metrics["shift"] = shift
+            metrics["price_change_pct"] = price_change_pct
+            metrics["persistence"] = persistence
+            metrics["history_samples"] = len(history)
+            metrics["opposite_wall_share"] = opposite_wall_share
             metrics["received_at_ms"] = int(now * 1000)
             metrics["exchange_event_at_ms"] = event_time
             metrics["age_ms"] = max(0, int(now * 1000 - event_time)) if event_time else None
@@ -203,7 +234,6 @@ class LiveScanner:
                             if time.time() - self.last_market_refresh >= MARKET_REFRESH_SECONDS:
                                 changed = await self.refresh_markets()
                                 if changed:
-                                    # Reconnect so the new socket has exactly the current market set.
                                     break
                             continue
 
@@ -294,6 +324,8 @@ class LiveScanner:
                 "imbalance": item["imbalance"],
                 "pressure": item["pressure"],
                 "shift": item["shift"],
+                "persistence": item["persistence"],
+                "price_change_pct": item["price_change_pct"],
                 "bids": item["bid_levels"][:levels],
                 "asks": item["ask_levels"][:levels],
                 "received_at_ms": item["received_at_ms"],
