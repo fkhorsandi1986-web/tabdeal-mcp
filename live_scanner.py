@@ -15,6 +15,7 @@ TABDEAL_WS = os.getenv("TABDEAL_WS", "wss://api1.tabdeal.org/stream/")
 DEPTH_LEVELS = max(1, min(int(os.getenv("DEPTH_LEVELS", "20")), 100))
 SUBSCRIBE_BATCH = max(1, min(int(os.getenv("SUBSCRIBE_BATCH", "100")), 250))
 MARKET_REFRESH_SECONDS = max(30, int(os.getenv("MARKET_REFRESH_SECONDS", "300")))
+STALE_AFTER_SECONDS = max(5, int(os.getenv("STALE_AFTER_SECONDS", "20")))
 MAX_HISTORY = max(5, int(os.getenv("MAX_HISTORY", "30")))
 
 logger = logging.getLogger("tabdeal-live-scanner")
@@ -60,19 +61,22 @@ class LiveScanner:
             raise RuntimeError("No active markets returned by exchangeInfo")
         return result
 
-    async def refresh_markets(self) -> None:
+    async def refresh_markets(self) -> bool:
+        """Refresh active markets and report whether the subscription set changed."""
         symbols = await self.fetch_exchange_info()
         async with self._lock:
             old = set(self.symbols)
+            new = set(symbols)
+            changed = old != new
             self.symbols = symbols
             self.last_market_refresh = time.time()
             for symbol in symbols:
                 self.history.setdefault(symbol, deque(maxlen=MAX_HISTORY))
-            # Remove stale books for markets no longer active.
-            for symbol in old - set(symbols):
+            for symbol in old - new:
                 self.books.pop(symbol, None)
                 self.history.pop(symbol, None)
-        logger.info("Loaded %d active markets", len(symbols))
+        logger.info("Loaded %d active markets (changed=%s)", len(symbols), changed)
+        return changed
 
     @staticmethod
     def _book_metrics(symbol: str, data: dict[str, Any], depth_levels: int) -> dict[str, Any] | None:
@@ -196,15 +200,11 @@ class LiveScanner:
                                 raw = raw.decode("utf-8", errors="replace")
                             await self.handle_message(raw)
                         except asyncio.TimeoutError:
-                            # Keep the socket alive and refresh the market list periodically.
                             if time.time() - self.last_market_refresh >= MARKET_REFRESH_SECONDS:
-                                await self.refresh_markets()
-                                current = set(self.symbols)
-                                missing = [s for s in self.symbols if s not in set(subscribed_symbols)]
-                                if missing:
-                                    await self._subscribe(ws, missing)
-                                    subscribed_symbols.extend(missing)
-                                subscribed_symbols = [s for s in subscribed_symbols if s in current]
+                                changed = await self.refresh_markets()
+                                if changed:
+                                    # Reconnect so the new socket has exactly the current market set.
+                                    break
                             continue
 
             except (ConnectionClosed, OSError, asyncio.TimeoutError, httpx.HTTPError, RuntimeError) as exc:
@@ -221,26 +221,40 @@ class LiveScanner:
                 backoff = min(backoff * 2, 60)
 
     async def start(self) -> None:
-        # websocket_loop owns its own retry cycle, including exchangeInfo failures.
         await self.websocket_loop()
 
     async def stop(self) -> None:
         self._stop.set()
 
+    @staticmethod
+    def _fresh(item: dict[str, Any], now_ms: int) -> tuple[bool, float]:
+        received = int(item.get("received_at_ms", 0) or 0)
+        age_seconds = max(0.0, (now_ms - received) / 1000.0) if received else float("inf")
+        return age_seconds <= STALE_AFTER_SECONDS, age_seconds
+
     async def snapshot(self, limit: int = 100) -> dict[str, Any]:
         limit = max(1, min(int(limit), 1000))
+        now_ms = int(time.time() * 1000)
         async with self._lock:
             rows = []
+            fresh_count = 0
             for item in self.books.values():
+                fresh, age_seconds = self._fresh(item, now_ms)
+                if fresh:
+                    fresh_count += 1
                 row = {k: v for k, v in item.items() if k not in {"bid_levels", "ask_levels"}}
+                row["live_age_seconds"] = round(age_seconds, 3) if age_seconds != float("inf") else None
+                row["stale"] = not fresh
                 rows.append(row)
-            rows.sort(key=lambda x: (abs(float(x.get("imbalance", 0))), -float(x.get("spread_pct", 0))), reverse=True)
+            rows.sort(key=lambda x: (x["stale"], -abs(float(x.get("imbalance", 0))), float(x.get("spread_pct", 0))))
             return {
                 "source": "Tabdeal public market WebSocket",
-                "generated_at_ms": int(time.time() * 1000),
+                "generated_at_ms": now_ms,
                 "connected": self.connected,
                 "market_count": len(self.symbols),
-                "markets_with_live_book": len(rows),
+                "markets_with_live_book": fresh_count,
+                "markets_with_any_book": len(rows),
+                "stale_after_seconds": STALE_AFTER_SECONDS,
                 "last_message_at_ms": int(self.last_message_at * 1000) if self.last_message_at else None,
                 "last_error": self.last_error,
                 "markets": rows[:limit],
@@ -249,15 +263,30 @@ class LiveScanner:
     async def orderbook(self, symbol: str, levels: int = 20) -> dict[str, Any]:
         symbol = symbol.upper().replace("_", "")
         levels = max(1, min(int(levels), DEPTH_LEVELS))
+        now_ms = int(time.time() * 1000)
         async with self._lock:
             item = self.books.get(symbol)
             if not item:
                 return {"symbol": symbol, "available": False, "reason": "No live order-book update received yet"}
+            fresh, age_seconds = self._fresh(item, now_ms)
+            if not fresh:
+                return {
+                    "source": "Tabdeal public market WebSocket",
+                    "symbol": symbol,
+                    "available": False,
+                    "stale": True,
+                    "live_age_seconds": round(age_seconds, 3),
+                    "reason": f"Last order-book update is older than {STALE_AFTER_SECONDS} seconds",
+                    "received_at_ms": item["received_at_ms"],
+                    "exchange_event_at_ms": item["exchange_event_at_ms"],
+                }
             return {
                 "source": "Tabdeal public market WebSocket",
                 "symbol": symbol,
                 "available": True,
-                "generated_at_ms": int(time.time() * 1000),
+                "stale": False,
+                "live_age_seconds": round(age_seconds, 3),
+                "generated_at_ms": now_ms,
                 "best_bid": item["best_bid"],
                 "best_ask": item["best_ask"],
                 "mid": item["mid"],
