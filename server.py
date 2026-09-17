@@ -1,6 +1,8 @@
-import os
+import asyncio
 import json
+import os
 import httpx
+from starlette.responses import JSONResponse
 from mcp.server import MCPServer
 
 TABDEAL_BASE = "https://api1.tabdeal.org"
@@ -14,13 +16,63 @@ mcp = MCPServer(
     ),
 )
 
+_live_scanner = None
+_live_task = None
 
-async def tabdeal_get(path: str, params: dict | None = None):
-    url = f"{TABDEAL_BASE}{path}"
-    async with httpx.AsyncClient(timeout=20.0) as client:
-        response = await client.get(url, params=params)
-        response.raise_for_status()
-        return response.json()
+
+async def _ensure_live_scanner():
+    """Start the shared WebSocket scanner once, so /api/check and the MCP tool use live data."""
+    global _live_scanner, _live_task
+    if _live_scanner is None:
+        from live_scanner import LiveScanner
+        _live_scanner = LiveScanner()
+    if _live_task is None or _live_task.done():
+        _live_task = asyncio.create_task(_live_scanner.start(), name="tabdeal-live-scanner")
+    # Give the socket a short window to receive fresh books on first use.
+    for _ in range(12):
+        try:
+            snap = await _live_scanner.snapshot(limit=1)
+            if snap.get("markets_with_live_book", 0) > 0:
+                return snap
+        except Exception:
+            pass
+        await asyncio.sleep(0.25)
+    return await _live_scanner.snapshot(limit=1)
+
+
+async def _build_live_check(limit: int = 1):
+    """Scan live Tabdeal markets and return the strongest data-confirmed candidates."""
+    from target_engine import build_targets
+    from app import _enrich_targets
+
+    snapshot = await _ensure_live_scanner()
+    full = await _live_scanner.snapshot(limit=1000)
+    candidates = build_targets(full["markets"], limit=60)
+    targets, tier_counts = await _enrich_targets(candidates)
+    targets = targets[:max(1, min(int(limit), 10))]
+
+    return {
+        "source": "Tabdeal live public market WebSocket + public trades REST",
+        "generated_at_ms": full.get("generated_at_ms"),
+        "market_count": full.get("market_count", 0),
+        "live_market_count": full.get("markets_with_live_book", 0),
+        "candidate_count_before_trade_confirmation": len(candidates),
+        "signal_tier_counts": tier_counts,
+        "targets": targets,
+        "method": "order-book imbalance + shift + spread + recent public trade flow + signal tier",
+        "not_a_prediction": True,
+        "scanner_status": {
+            "connected": full.get("connected"),
+            "last_message_at_ms": full.get("last_message_at_ms"),
+            "last_error": full.get("last_error"),
+        },
+    }
+
+
+@mcp.tool()
+async def tabdeal_check() -> str:
+    """One-command live Tabdeal scan. Finds the strongest currently confirmed market candidates using live order books, spread, imbalance, rapid shifts, and recent public trade flow. Read-only; never trades."""
+    return json.dumps(await _build_live_check(limit=3), ensure_ascii=False)
 
 
 @mcp.tool()
@@ -39,6 +91,14 @@ async def tabdeal_exchange_info() -> str:
                     active.append(item)
             return json.dumps({"source": "Tabdeal public API", "active_market_count": len(active), "markets": active}, ensure_ascii=False)
     return json.dumps(data, ensure_ascii=False)
+
+
+async def tabdeal_get(path: str, params: dict | None = None):
+    url = f"{TABDEAL_BASE}{path}"
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        response = await client.get(url, params=params)
+        response.raise_for_status()
+        return response.json()
 
 
 @mcp.tool()
@@ -86,43 +146,21 @@ async def tabdeal_scan_markets(symbols: str = "ARXUSDT,BTCUSDT,ETHUSDT,SOLUSDT")
     return json.dumps({"source": "Tabdeal public API", "market_count": len(results), "markets": results}, ensure_ascii=False)
 
 
-@mcp.tool()
-async def tabdeal_target(symbol: str) -> str:
-    """Return a transparent analytical target plan for one market from a fresh public order book.
-
-    Targets are rule-based reference levels, not guaranteed predictions or trading instructions.
-    """
-    from target_engine import build_target
-    symbol = symbol.upper().strip()
-    depth = await tabdeal_get("/r/api/v1/depth", {"symbol": symbol, "limit": 50})
-    bids = depth.get("bids", depth.get("b", [])) if isinstance(depth, dict) else []
-    asks = depth.get("asks", depth.get("a", [])) if isinstance(depth, dict) else []
-    if not bids or not asks:
-        return json.dumps({"symbol": symbol, "available": False, "reason": "No order-book data"}, ensure_ascii=False)
-    best_bid = float(bids[0][0])
-    best_ask = float(asks[0][0])
-    mid = (best_bid + best_ask) / 2
-    bid_value = sum(float(x[0]) * float(x[1]) for x in bids[:20])
-    ask_value = sum(float(x[0]) * float(x[1]) for x in asks[:20])
-    total = bid_value + ask_value
-    imbalance = (bid_value - ask_value) / total if total else 0.0
-    item = {
-        "symbol": symbol,
-        "mid": mid,
-        "spread_pct": ((best_ask - best_bid) / mid * 100) if mid else 0,
-        "imbalance": imbalance,
-        "shift": 0.0,
-        "live_age_seconds": 0.0,
-        "stale": False,
-    }
-    target = build_target(item)
-    return json.dumps({"source": "Tabdeal public API", "available": target is not None, "target": target, "not_a_prediction": True}, ensure_ascii=False)
+@mcp.custom_route("/api/check", methods=["GET"])
+async def check_route(request):
+    try:
+        limit = int(request.query_params.get("limit", "3"))
+    except ValueError:
+        limit = 3
+    try:
+        return JSONResponse(await _build_live_check(limit=limit))
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=503)
 
 
 @mcp.custom_route("/health", methods=["GET"])
 async def health(request):
-    from starlette.responses import JSONResponse
-    return JSONResponse({"status": "ok", "service": "tabdeal-mcp", "mode": "read-only", "source": "Tabdeal public API"})
+    return JSONResponse({"status": "ok", "service": "tabdeal-mcp", "mode": "read-only", "source": "Tabdeal public API", "live_check": True})
 
 
 if __name__ == "__main__":
