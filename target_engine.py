@@ -10,13 +10,7 @@ MAX_LIVE_AGE_SECONDS = 20.0
 
 
 def build_target(item: dict[str, Any]) -> dict[str, Any] | None:
-    """Build a transparent analytical target from a fresh live order book.
-
-    This layer is intentionally conservative: it produces a candidate only
-    when the book is fresh, directional, and reasonably tradable. Public
-    trade-flow confirmation is added by app.py before a candidate is promoted
-    to A_STRONG/B_WATCH.
-    """
+    """Build a transparent analytical target from a fresh live order book."""
     if item.get("stale"):
         return None
     try:
@@ -57,8 +51,6 @@ def build_target(item: dict[str, Any]) -> dict[str, Any] | None:
     if not confirmed:
         return None
 
-    # Use the visible executable side as an additional reference while keeping
-    # mid-price as the neutral entry reference used by the target math.
     entry_side_price = best_ask if direction == "LONG" else best_bid
 
     spread_penalty = min(0.25, spread_pct / MAX_TARGET_SPREAD_PCT * 0.25)
@@ -66,9 +58,6 @@ def build_target(item: dict[str, Any]) -> dict[str, Any] | None:
     base_pct *= 1.0 - spread_penalty
     target_pcts = [base_pct, base_pct * 1.75, base_pct * 2.50]
 
-    # Keep invalidation bounded so a very large visible imbalance does not
-    # create an impractically wide stop. It is a rule-based invalidation, not
-    # a claim about the user's personal risk tolerance.
     invalidation_pct = max(0.35, min(0.60, abs_imbalance * 0.50 * 100))
     if direction == "LONG":
         targets = [round(mid * (1 + p / 100), 12) for p in target_pcts]
@@ -77,7 +66,6 @@ def build_target(item: dict[str, Any]) -> dict[str, Any] | None:
         targets = [round(mid * (1 - p / 100), 12) for p in target_pcts]
         invalidation = round(mid * (1 + invalidation_pct / 100), 12)
 
-    # 70% imbalance, 20% shift persistence, 10% spread quality.
     imbalance_component = min(1.0, abs_imbalance)
     shift_component = min(1.0, abs(shift) / 0.10)
     spread_component = max(0.0, 1.0 - spread_pct / MAX_TARGET_SPREAD_PCT)
@@ -129,12 +117,12 @@ def build_target(item: dict[str, Any]) -> dict[str, Any] | None:
 
 def build_targets(markets: list[dict[str, Any]], limit: int = 20) -> list[dict[str, Any]]:
     targets = [target for item in markets if (target := build_target(item)) is not None]
+    # Higher strength first; for equal strength prefer tighter spreads and fresher data.
     targets.sort(
         key=lambda x: (
-            x["signal_strength"],
-            -x["spread_pct"],
-            -x["live_age_seconds"],
-        ),
-        reverse=True,
+            -x["signal_strength"],
+            x["spread_pct"],
+            x["live_age_seconds"],
+        )
     )
     return targets[: max(1, min(int(limit), 100))]
