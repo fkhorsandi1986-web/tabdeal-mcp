@@ -11,7 +11,7 @@ from starlette.responses import JSONResponse
 from starlette.routing import Route
 
 from live_scanner import LiveScanner, fetch_public_trades
-from target_engine import build_targets
+from target_engine import build_target, build_targets
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
@@ -64,6 +64,7 @@ async def capabilities(request: Request):
             "trade_flow_confirmation": True,
             "analytical_targets": True,
             "signal_tiers": True,
+            "on_demand_symbol_analysis": True,
         },
         "not_claimed_without_a_public_source": [
             "private account data",
@@ -79,6 +80,7 @@ async def capabilities(request: Request):
             "Recent trades are available from Tabdeal's public REST endpoint.",
             "Targets combine order-book imbalance, shift, spread quality, and recent public trade flow.",
             "Signal tiers are filters for data quality and confirmation, not guaranteed predictions.",
+            "The analyze endpoint is intended for on-demand questions about a specific coin.",
         ],
     })
 
@@ -143,12 +145,9 @@ def _classify_signal(target: dict, flow: dict) -> tuple[str, list[str]] | None:
     shift = abs(float(target.get("shift", 0.0)))
     flow_ratio = float(flow.get("directional_flow_ratio", 0.0))
 
-    # Hard reject: expensive spread or directional trade flow disagreement.
     if spread > 1.20 or flow_ratio < 0.52:
         return None
 
-    # A = strong confirmation: deep book imbalance, agreeing aggressive flow,
-    # tight spread, plus either measurable shift or exceptionally strong imbalance.
     if (
         imbalance >= 0.45
         and flow_ratio >= 0.65
@@ -166,8 +165,6 @@ def _classify_signal(target: dict, flow: dict) -> tuple[str, list[str]] | None:
             reasons.append("A: exceptionally strong static imbalance compensates for weak shift")
         return "A_STRONG", reasons
 
-    # B = watch: direction is confirmed, but one strong-confirmation component
-    # is missing. It remains visible so the scanner can monitor it for escalation.
     if imbalance >= 0.20 and flow_ratio >= 0.52 and spread <= 1.20:
         reasons = [
             "B: order-book direction confirmed",
@@ -206,8 +203,6 @@ async def _enrich_targets(targets: list[dict]) -> tuple[list[dict], dict[str, in
         enriched["signal_tier"] = tier
         enriched["trade_flow"] = flow
         enriched["reasons"] = list(enriched.get("reasons", [])) + tier_reasons
-        # Strength remains a descriptive indicator. It is adjusted for actual
-        # trade-flow agreement but is never presented as probability.
         enriched["signal_strength"] = round(
             min(100.0, enriched["signal_strength"] * 0.75 + flow["directional_flow_ratio"] * 25.0),
             2,
@@ -218,9 +213,8 @@ async def _enrich_targets(targets: list[dict]) -> tuple[list[dict], dict[str, in
 
     enriched = await asyncio.gather(*(one(target) for target in targets))
     results = [item for item in enriched if item is not None]
-    # Always put strong confirmations first; within a tier use signal strength.
     tier_order = {"A_STRONG": 0, "B_WATCH": 1}
-    results.sort(key=lambda x: (tier_order.get(x["signal_tier"], 9), -x["signal_strength"]))
+    results.sort(key=lambda x: (tier_order.get(x["signal_tier"], 9), -x["signal_strength"], x["spread_pct"], x["live_age_seconds"]))
     return results, counts
 
 
@@ -231,8 +225,6 @@ async def targets_endpoint(request: Request):
         limit = 20
 
     snapshot = await scanner.snapshot(limit=1000)
-    # First shortlist by live order-book quality, then confirm only the best
-    # candidates with recent public trades to avoid hammering the REST API.
     candidates = build_targets(snapshot["markets"], limit=60)
     targets, tier_counts = await _enrich_targets(candidates)
     targets = targets[: max(1, min(limit, 100))]
@@ -252,6 +244,61 @@ async def targets_endpoint(request: Request):
             "rejected": "spread/flow/confirmation conflict; omitted from targets",
         },
         "not_a_prediction": True,
+    })
+
+
+async def analyze_endpoint(request: Request):
+    """On-demand deep analysis for one requested Tabdeal symbol."""
+    raw_symbol = request.path_params["symbol"]
+    symbol = raw_symbol.upper().replace("_", "").replace("/", "")
+    snapshot = await scanner.snapshot(limit=1000)
+    item = next((row for row in snapshot["markets"] if str(row.get("symbol", "")).upper() == symbol), None)
+
+    if item is None:
+        return JSONResponse({
+            "symbol": symbol,
+            "available": False,
+            "reason": "No live order-book data for this symbol. Check /api/markets for active symbols.",
+            "market_count": snapshot["market_count"],
+        }, status_code=404)
+
+    target = build_target(item)
+    flow = None
+    classification = None
+    if target:
+        flow = await _trade_flow(symbol, target["direction"])
+        if flow:
+            classification = _classify_signal(target, flow)
+            if classification:
+                tier, tier_reasons = classification
+                target = dict(target)
+                target["signal_tier"] = tier
+                target["trade_flow"] = flow
+                target["reasons"] = list(target.get("reasons", [])) + tier_reasons
+                target["signal_strength"] = round(
+                    min(100.0, target["signal_strength"] * 0.75 + flow["directional_flow_ratio"] * 25.0), 2
+                )
+
+    return JSONResponse({
+        "source": "Tabdeal live public market data",
+        "generated_at_ms": snapshot["generated_at_ms"],
+        "symbol": symbol,
+        "available": True,
+        "market": item,
+        "target": target,
+        "trade_flow": flow,
+        "signal_tier": classification[0] if classification else None,
+        "actionability": (
+            "confirmed candidate" if classification and classification[0] == "A_STRONG"
+            else "watch candidate" if classification and classification[0] == "B_WATCH"
+            else "no confirmed setup"
+        ),
+        "not_a_prediction": True,
+        "notes": [
+            "This endpoint is for on-demand analysis when the user asks about a specific coin.",
+            "A missing target means the live order book did not meet the minimum directional criteria.",
+            "A/B classification requires recent public trade-flow confirmation.",
+        ],
     })
 
 
@@ -290,6 +337,7 @@ routes = [
     Route("/api/capabilities", capabilities, methods=["GET"]),
     Route("/api/scanner", scanner_endpoint, methods=["GET"]),
     Route("/api/targets", targets_endpoint, methods=["GET"]),
+    Route("/api/analyze/{symbol}", analyze_endpoint, methods=["GET"]),
     Route("/api/markets", markets_endpoint, methods=["GET"]),
     Route("/api/orderbook/{symbol}", orderbook_endpoint, methods=["GET"]),
     Route("/api/trades/{symbol}", trades_endpoint, methods=["GET"]),
