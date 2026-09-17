@@ -11,6 +11,7 @@ from starlette.responses import JSONResponse
 from starlette.routing import Route
 
 from live_scanner import LiveScanner, fetch_public_trades
+from target_engine import build_targets
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
@@ -60,6 +61,7 @@ async def capabilities(request: Request):
             "imbalance": True,
             "rapid_imbalance_shift": True,
             "public_recent_trades": True,
+            "analytical_targets": True,
         },
         "not_claimed_without_a_public_source": [
             "private account data",
@@ -73,6 +75,7 @@ async def capabilities(request: Request):
             "The scanner never places, cancels, or modifies orders.",
             "Order-book values are visible market liquidity, not proof of whale ownership.",
             "Recent trades are available on demand from Tabdeal's public REST endpoint.",
+            "Targets are transparent rule-based analytical levels, not guaranteed predictions.",
         ],
     })
 
@@ -83,6 +86,24 @@ async def scanner_endpoint(request: Request):
     except ValueError:
         limit = 100
     return JSONResponse(await scanner.snapshot(limit=limit))
+
+
+async def targets_endpoint(request: Request):
+    try:
+        limit = int(request.query_params.get("limit", "20"))
+    except ValueError:
+        limit = 20
+    snapshot = await scanner.snapshot(limit=1000)
+    targets = build_targets(snapshot["markets"], limit=limit)
+    return JSONResponse({
+        "source": "Tabdeal public market WebSocket",
+        "generated_at_ms": snapshot["generated_at_ms"],
+        "market_count": snapshot["market_count"],
+        "live_market_count": snapshot["markets_with_live_book"],
+        "targets": targets,
+        "method": "live order-book imbalance + imbalance shift",
+        "not_a_prediction": True,
+    })
 
 
 async def markets_endpoint(request: Request):
@@ -119,6 +140,7 @@ routes = [
     Route("/health", health, methods=["GET"]),
     Route("/api/capabilities", capabilities, methods=["GET"]),
     Route("/api/scanner", scanner_endpoint, methods=["GET"]),
+    Route("/api/targets", targets_endpoint, methods=["GET"]),
     Route("/api/markets", markets_endpoint, methods=["GET"]),
     Route("/api/orderbook/{symbol}", orderbook_endpoint, methods=["GET"]),
     Route("/api/trades/{symbol}", trades_endpoint, methods=["GET"]),
