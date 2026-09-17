@@ -1,5 +1,4 @@
-from contextlib import asynccontextmanager
-from contextlib import AsyncExitStack
+from contextlib import asynccontextmanager, AsyncExitStack
 
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
@@ -106,7 +105,10 @@ async def lifespan(host_app: Starlette):
 
 
 app = Starlette(
-    routes=[Mount("/mcp", app=mcp_app)],
+    routes=[
+        Mount("/mcp", app=mcp_app),
+        Mount("/", app=rest.app),
+    ],
     lifespan=lifespan,
 )
 
