@@ -7,10 +7,16 @@ MIN_IMBALANCE = 0.20
 STRONG_IMBALANCE = 0.45
 MIN_SHIFT_CONFIRMATION = 0.005
 MAX_LIVE_AGE_SECONDS = 20.0
+MIN_PERSISTENCE = 0.30
+MAX_OPPOSITE_WALL_SHARE = 0.55
+
+
+def _clamp(value: float, low: float = 0.0, high: float = 1.0) -> float:
+    return max(low, min(high, value))
 
 
 def build_target(item: dict[str, Any]) -> dict[str, Any] | None:
-    """Build a transparent analytical target from a fresh live order book."""
+    """Build a transparent target using book direction, depth quality and persistence."""
     if item.get("stale"):
         return None
     try:
@@ -21,12 +27,20 @@ def build_target(item: dict[str, Any]) -> dict[str, Any] | None:
         imbalance = float(item.get("imbalance", 0.0))
         shift = float(item.get("shift", 0.0))
         age = float(item.get("live_age_seconds", 999999))
+        persistence = float(item.get("persistence", 1.0))
+        opposite_wall_share = float(item.get("opposite_wall_share", 0.0))
+        price_change_pct = float(item.get("price_change_pct", 0.0))
+        largest_bid_share = float(item.get("largest_bid_share", 0.0))
+        largest_ask_share = float(item.get("largest_ask_share", 0.0))
+        total_depth_value = float(item.get("total_depth_value", 0.0))
     except (KeyError, TypeError, ValueError):
         return None
 
     if mid <= 0 or age > MAX_LIVE_AGE_SECONDS or spread_pct <= 0 or spread_pct > MAX_TARGET_SPREAD_PCT:
         return None
     if best_bid <= 0 or best_ask <= 0 or best_bid > best_ask:
+        return None
+    if total_depth_value < 0:
         return None
 
     abs_imbalance = abs(imbalance)
@@ -50,8 +64,36 @@ def build_target(item: dict[str, Any]) -> dict[str, Any] | None:
 
     if not confirmed:
         return None
+    if persistence < MIN_PERSISTENCE:
+        return None
+    if opposite_wall_share > MAX_OPPOSITE_WALL_SHARE:
+        return None
 
     entry_side_price = best_ask if direction == "LONG" else best_bid
+
+    # A very concentrated wall can be useful liquidity but is also easier to spoof.
+    dominant_wall_share = largest_bid_share if direction == "LONG" else largest_ask_share
+    wall_risk = _clamp((dominant_wall_share - 0.25) / 0.50)
+    persistence_quality = _clamp((persistence - MIN_PERSISTENCE) / 0.70)
+    spread_quality = _clamp(1.0 - spread_pct / MAX_TARGET_SPREAD_PCT)
+    shift_quality = _clamp(abs(shift) / 0.10)
+    book_quality = _clamp((abs_imbalance - MIN_IMBALANCE) / (1.0 - MIN_IMBALANCE))
+
+    # Price movement is a confirmation signal, not a reason by itself to chase.
+    price_confirmation = _clamp(abs(price_change_pct) / 1.0)
+    if (direction == "LONG" and price_change_pct > 0) or (direction == "SHORT" and price_change_pct < 0):
+        price_confirmation *= 1.0
+    else:
+        price_confirmation *= 0.45
+
+    strength = (
+        book_quality * 35.0
+        + persistence_quality * 25.0
+        + shift_quality * 15.0
+        + spread_quality * 10.0
+        + price_confirmation * 10.0
+        + (1.0 - wall_risk) * 5.0
+    )
 
     spread_penalty = min(0.25, spread_pct / MAX_TARGET_SPREAD_PCT * 0.25)
     base_pct = max(0.30, min(1.50, 0.35 + abs_imbalance * 0.80 + abs(shift) * 0.40))
@@ -66,15 +108,6 @@ def build_target(item: dict[str, Any]) -> dict[str, Any] | None:
         targets = [round(mid * (1 - p / 100), 12) for p in target_pcts]
         invalidation = round(mid * (1 + invalidation_pct / 100), 12)
 
-    imbalance_component = min(1.0, abs_imbalance)
-    shift_component = min(1.0, abs(shift) / 0.10)
-    spread_component = max(0.0, 1.0 - spread_pct / MAX_TARGET_SPREAD_PCT)
-    strength = (
-        imbalance_component * 70.0
-        + shift_component * 20.0
-        + spread_component * 10.0
-    )
-
     risk_distance_pct = invalidation_pct
     reward_distance_pct = target_pcts[0]
     risk_reward = reward_distance_pct / risk_distance_pct if risk_distance_pct else 0.0
@@ -82,14 +115,34 @@ def build_target(item: dict[str, Any]) -> dict[str, Any] | None:
     quality_flags = []
     if abs_imbalance >= STRONG_IMBALANCE:
         quality_flags.append("strong_book_imbalance")
+    if persistence >= 0.70:
+        quality_flags.append("persistent_direction")
+    elif persistence >= MIN_PERSISTENCE:
+        quality_flags.append("developing_persistence")
     if abs(shift) >= MIN_SHIFT_CONFIRMATION:
         quality_flags.append("measurable_shift")
     if spread_pct <= 0.70:
         quality_flags.append("tight_spread")
     elif spread_pct > 1.20:
         quality_flags.append("wide_spread_watch")
+    if wall_risk >= 0.60:
+        quality_flags.append("wall_concentration_risk")
+    if price_confirmation >= 0.60:
+        quality_flags.append("price_confirms_direction")
+    elif abs(price_change_pct) >= 0.50:
+        quality_flags.append("price_movement_needs_caution")
     if not quality_flags:
         quality_flags.append("basic_directional_book")
+
+    reasons.extend([
+        f"direction persistence {persistence:.0%}",
+        f"opposite-wall share {opposite_wall_share:.0%}",
+        f"depth-wall concentration risk {wall_risk:.0%}",
+    ])
+    if price_confirmation >= 0.60:
+        reasons.append("recent price movement agrees with direction")
+    elif abs(price_change_pct) >= 0.50:
+        reasons.append("recent price movement is strong enough to avoid chasing blindly")
 
     return {
         "symbol": item.get("symbol"),
@@ -108,20 +161,28 @@ def build_target(item: dict[str, Any]) -> dict[str, Any] | None:
         "spread_pct": round(spread_pct, 6),
         "imbalance": round(imbalance, 6),
         "shift": round(shift, 6),
+        "persistence": round(persistence, 4),
+        "price_change_pct": round(price_change_pct, 6),
+        "largest_bid_share": round(largest_bid_share, 6),
+        "largest_ask_share": round(largest_ask_share, 6),
+        "opposite_wall_share": round(opposite_wall_share, 6),
+        "wall_risk": round(wall_risk, 4),
+        "total_depth_value": round(total_depth_value, 8),
         "quality_flags": quality_flags,
         "reasons": reasons,
-        "method": "live order-book imbalance + shift + spread quality; trade-flow confirmation when available",
+        "method": "live order-book imbalance + depth quality + persistence + price confirmation + spread + wall-risk; public trade-flow confirmation when available",
         "not_a_prediction": True,
     }
 
 
 def build_targets(markets: list[dict[str, Any]], limit: int = 20) -> list[dict[str, Any]]:
     targets = [target for item in markets if (target := build_target(item)) is not None]
-    # Higher strength first; for equal strength prefer tighter spreads and fresher data.
+    # Combined quality first; then tighter spreads and fresher data.
     targets.sort(
         key=lambda x: (
             -x["signal_strength"],
             x["spread_pct"],
+            -x["persistence"],
             x["live_age_seconds"],
         )
     )
