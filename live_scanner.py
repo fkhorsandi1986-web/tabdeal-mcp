@@ -12,11 +12,11 @@ from websockets.exceptions import ConnectionClosed
 
 TABDEAL_BASE = os.getenv("TABDEAL_BASE", "https://api1.tabdeal.org").rstrip("/")
 TABDEAL_WS = os.getenv("TABDEAL_WS", "wss://api1.tabdeal.org/stream/")
-DEPTH_LEVELS = max(1, min(int(os.getenv("DEPTH_LEVELS", "20")), 100))
+DEPTH_LEVELS = max(1, min(int(os.getenv("DEPTH_LEVELS", "10")), 20))
 SUBSCRIBE_BATCH = max(1, min(int(os.getenv("SUBSCRIBE_BATCH", "100")), 250))
 MARKET_REFRESH_SECONDS = max(30, int(os.getenv("MARKET_REFRESH_SECONDS", "300")))
 STALE_AFTER_SECONDS = max(5, int(os.getenv("STALE_AFTER_SECONDS", "20")))
-MAX_HISTORY = max(15, int(os.getenv("MAX_HISTORY", "60")))
+MAX_HISTORY = max(10, int(os.getenv("MAX_HISTORY", "20")))
 
 logger = logging.getLogger("tabdeal-live-scanner")
 
@@ -167,7 +167,7 @@ class LiveScanner:
 
             recent = list(history)
             window10 = recent[-10:]
-            window30 = recent[-30:]
+            window30 = recent[-20:]
 
             def persistence(rows: list[dict[str, float]]) -> float:
                 if not rows:
@@ -202,8 +202,7 @@ class LiveScanner:
                 "shift": shift, "price_change_pct": price_change_pct,
                 "momentum_5_pct": momentum_5, "momentum_15_pct": momentum_15,
                 "persistence": persistence10, "persistence_30": persistence30,
-                "imbalance_volatility": imbalance_volatility,
-                "history_samples": len(history), "opposite_wall_share": opposite_wall_share,
+                        "history_samples": len(history), "opposite_wall_share": opposite_wall_share,
                 "received_at_ms": int(now * 1000), "exchange_event_at_ms": event_time,
                 "age_ms": max(0, int(now * 1000 - event_time)) if event_time else None,
                 "pressure": "BUY" if metrics["imbalance"] >= 0.15 else "SELL" if metrics["imbalance"] <= -0.15 else "NEUTRAL",
@@ -261,7 +260,7 @@ class LiveScanner:
         age_seconds = max(0.0, (now_ms - received) / 1000.0) if received else float("inf")
         return age_seconds <= STALE_AFTER_SECONDS, age_seconds
 
-    async def snapshot(self, limit: int = 100) -> dict[str, Any]:
+    async def snapshot(self, limit: int = 20) -> dict[str, Any]:
         limit = max(1, min(int(limit), 1000))
         now_ms = int(time.time() * 1000)
         async with self._lock:
@@ -303,7 +302,7 @@ class LiveScanner:
                 "spread_pct": item["spread_pct"], "imbalance": item["imbalance"], "near_imbalance": item["near_imbalance"],
                 "pressure": item["pressure"], "shift": item["shift"], "persistence": item["persistence"],
                 "persistence_30": item["persistence_30"], "momentum_5_pct": item["momentum_5_pct"],
-                "momentum_15_pct": item["momentum_15_pct"], "imbalance_volatility": item["imbalance_volatility"],
+                "momentum_15_pct": item["momentum_15_pct"],
                 "price_change_pct": item["price_change_pct"], "bids": item["bid_levels"][:levels], "asks": item["ask_levels"][:levels],
                 "received_at_ms": item["received_at_ms"], "exchange_event_at_ms": item["exchange_event_at_ms"],
             }
