@@ -87,7 +87,7 @@ async def capabilities(request: Request):
 
 async def scanner_endpoint(request: Request):
     try:
-        limit = int(request.query_params.get("limit", "100"))
+        limit = int(request.query_params.get("limit", "20"))
     except ValueError:
         limit = 100
     return JSONResponse(await scanner.snapshot(limit=limit))
@@ -95,7 +95,7 @@ async def scanner_endpoint(request: Request):
 
 async def _trade_flow(symbol: str, direction: str) -> dict | None:
     try:
-        payload = await fetch_public_trades(symbol, limit=30)
+        payload = await fetch_public_trades(symbol, limit=20)
         trades = payload.get("trades", [])
         if not isinstance(trades, list) or len(trades) < 3:
             return None
@@ -183,7 +183,7 @@ def _classify_signal(target: dict, flow: dict) -> tuple[str, list[str]] | None:
 
 
 async def _enrich_targets(targets: list[dict]) -> tuple[list[dict], dict[str, int]]:
-    semaphore = asyncio.Semaphore(8)
+    semaphore = asyncio.Semaphore(5)
     counts = {"A_STRONG": 0, "B_WATCH": 0, "rejected": 0}
 
     async def one(target: dict) -> dict | None:
@@ -225,9 +225,9 @@ async def targets_endpoint(request: Request):
         limit = 20
 
     snapshot = await scanner.snapshot(limit=1000)
-    candidates = build_targets(snapshot["markets"], limit=60)
+    candidates = build_targets(snapshot["markets"], limit=20)
     targets, tier_counts = await _enrich_targets(candidates)
-    targets = targets[: max(1, min(limit, 100))]
+    targets = targets[: max(1, min(limit, 20))]
 
     return JSONResponse({
         "source": "Tabdeal public market WebSocket + public trades REST",
