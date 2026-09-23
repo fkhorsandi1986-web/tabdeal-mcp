@@ -302,6 +302,78 @@ async def analyze_endpoint(request: Request):
     })
 
 
+async def compare_endpoint(request: Request):
+    """Live side-by-side comparison for two Tabdeal symbols."""
+    raw_a = request.path_params["symbol_a"]
+    raw_b = request.path_params["symbol_b"]
+    symbols = [
+        raw_a.upper().replace("_", "").replace("/", ""),
+        raw_b.upper().replace("_", "").replace("/", ""),
+    ]
+    # Keep the two requested symbols distinct while preserving request order.
+    symbols = list(dict.fromkeys(symbols))
+    snapshot = await scanner.snapshot(limit=1000)
+    by_symbol = {
+        str(row.get("symbol", "")).upper(): row
+        for row in snapshot["markets"]
+    }
+
+    results = []
+    for symbol in symbols:
+        item = by_symbol.get(symbol)
+        if item is None:
+            results.append({
+                "symbol": symbol,
+                "available": False,
+                "reason": "No live order-book data for this symbol.",
+            })
+            continue
+
+        target = build_target(item)
+        flow = None
+        classification = None
+        if target:
+            flow = await _trade_flow(symbol, target["direction"])
+            if flow:
+                classification = _classify_signal(target, flow)
+
+        results.append({
+            "symbol": symbol,
+            "available": True,
+            "market": item,
+            "target": target,
+            "trade_flow": flow,
+            "signal_tier": classification[0] if classification else None,
+            "actionability": (
+                "confirmed candidate" if classification and classification[0] == "A_STRONG"
+                else "watch candidate" if classification and classification[0] == "B_WATCH"
+                else "no confirmed setup"
+            ),
+        })
+
+    return JSONResponse({
+        "source": "Tabdeal live public market data",
+        "generated_at_ms": snapshot["generated_at_ms"],
+        "symbols": symbols,
+        "results": results,
+        "comparison_fields": [
+            "mid",
+            "spread_pct",
+            "imbalance",
+            "near_imbalance",
+            "bid_value",
+            "ask_value",
+            "momentum_5_pct",
+            "momentum_15_pct",
+            "persistence",
+            "opposite_wall_share",
+            "trade_flow",
+            "signal_tier",
+        ],
+        "not_a_prediction": True,
+    })
+
+
 async def markets_endpoint(request: Request):
     return JSONResponse(await scanner.market_list())
 
@@ -338,6 +410,7 @@ routes = [
     Route("/api/scanner", scanner_endpoint, methods=["GET"]),
     Route("/api/targets", targets_endpoint, methods=["GET"]),
     Route("/api/analyze/{symbol}", analyze_endpoint, methods=["GET"]),
+    Route("/api/compare/{symbol_a}/{symbol_b}", compare_endpoint, methods=["GET"]),
     Route("/api/markets", markets_endpoint, methods=["GET"]),
     Route("/api/orderbook/{symbol}", orderbook_endpoint, methods=["GET"]),
     Route("/api/trades/{symbol}", trades_endpoint, methods=["GET"]),
