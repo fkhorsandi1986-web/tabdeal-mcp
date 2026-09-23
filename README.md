@@ -36,6 +36,7 @@ API عمومی مستند تبدیل، اطلاعات خصوصی حساب را �
 - `GET /api/scanner?limit=100` — خلاصه زنده بازارها و metrics
 - `GET /api/orderbook/BTCUSDT?levels=20` — اردربوک زنده یک نماد
 - `GET /api/trades/BTCUSDT?limit=100` — معاملات اخیر عمومی یک نماد
+- `GET /api/compare/AAVEUSDT/ARXUSDT` — مقایسه زنده دو نماد با order book، momentum، trade flow و signal tier
 
 این endpointها فقط GET هستند و هیچ API key یا secret تبدیل را به بیرون منتشر نمی‌کنند.
 
